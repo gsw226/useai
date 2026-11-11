@@ -1,226 +1,236 @@
 import SwiftUI
-import CryptoKit
+import Charts
+import UserNotifications
 
-// Menu bar clone of AI Limits Tracker. Endpoints/fields recovered from its Dart snapshot strings.
-// ponytail: Codex still reuses the Codex CLI login (~/.codex/auth.json); add its localhost:1455 OAuth if needed.
-
-struct Win: Identifiable { let id = UUID(); let name: String; let used: Double; let reset: Date? }
-struct Provider: Identifiable { let id: String; var wins: [Win] = []; var error: String? }
-struct Fail: Error, LocalizedError { let errorDescription: String?; init(_ s: String) { errorDescription = s } }
-
-func json(_ d: Data) -> [String: Any] { (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] ?? [:] }
-func num(_ v: Any?) -> Double? { (v as? NSNumber)?.doubleValue }
-
-func getJSON(_ url: String, _ headers: [String: String]) async throws -> [String: Any] {
-    var r = URLRequest(url: URL(string: url)!)
-    headers.forEach { r.setValue($1, forHTTPHeaderField: $0) }
-    let (d, resp) = try await URLSession.shared.data(for: r)
-    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-    if CommandLine.arguments.contains("--dump") { print(url, code, String(decoding: d, as: UTF8.self)); fflush(stdout) }
-    guard code == 200 else { throw Fail(code == 401 ? "토큰 만료 — CLI를 한 번 실행하세요" : code == 429 ? "요청 제한 중 — 이전 값 표시" : "HTTP \(code)") }
-    return json(d)
+struct Row: Identifiable {
+    let account: Account
+    var id: String { account.id }
+    var title: String { "\(account.kind.title) · \(account.label)" }
+    var wins: [Win] = []; var note: String?; var error: String?; var redeemable = false; var removable = true
 }
 
-let isoFrac: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
-func iso(_ v: Any?) -> Date? { (v as? String).flatMap { isoFrac.date(from: $0) ?? ISO8601DateFormatter().date(from: $0) } }
+struct Point: Codable { let t: Date; let remaining: Double }
 
-// --- Claude accounts: same OAuth client/flow the original app uses (Claude Code's public client, PKCE, paste-code) ---
-let claudeClient = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-let claudeRedirect = "https://console.anthropic.com/oauth/code/callback"
-let claudeUA = "claude-cli/2.1.280 (external, cli)" // exact string in the original snapshot (REA ev_ffa8cb30)
+let historyURL: URL = {
+    let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("UseAI")
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    return d.appendingPathComponent("history.json")
+}()
 
-struct ClaudeAccount: Codable, Identifiable { var id: String; var access: String; var refresh: String; var expires: Date }
-
-enum Vault { // all accounts as one JSON blob in the login keychain
-    static let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                      kSecAttrService as String: "UseAI", kSecAttrAccount as String: "claude-accounts"]
-    static func load() -> [ClaudeAccount] {
-        var q = base; q[kSecReturnData as String] = true
-        var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return [] }
-        return (try? JSONDecoder().decode([ClaudeAccount].self, from: d)) ?? []
-    }
-    static func save(_ a: [ClaudeAccount]) {
-        SecItemDelete(base as CFDictionary)
-        var q = base; q[kSecValueData as String] = try! JSONEncoder().encode(a)
-        SecItemAdd(q as CFDictionary, nil)
-    }
-}
-
-func b64url(_ d: Data) -> String {
-    d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
-        .replacingOccurrences(of: "=", with: "")
-}
-func randomB64(_ n: Int) -> String { b64url(Data((0..<n).map { _ in UInt8.random(in: 0...255) })) }
-
-func authorizeURL(verifier: String, state: String) -> URL {
-    var c = URLComponents(string: "https://claude.ai/oauth/authorize")!
-    c.queryItems = [("code", "true"), ("client_id", claudeClient), ("response_type", "code"),
-                    ("redirect_uri", claudeRedirect), ("scope", "org:create_api_key user:profile user:inference"),
-                    ("code_challenge", b64url(Data(SHA256.hash(data: Data(verifier.utf8))))),
-                    ("code_challenge_method", "S256"), ("state", state)].map(URLQueryItem.init)
-    return c.url!
-}
-
-func tokenCall(_ body: [String: String]) async throws -> [String: Any] {
-    var r = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
-    r.httpMethod = "POST"
-    r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    r.setValue(claudeUA, forHTTPHeaderField: "User-Agent")
-    r.httpBody = try JSONSerialization.data(withJSONObject: body)
-    let (d, resp) = try await URLSession.shared.data(for: r)
-    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-    guard code == 200 else { throw Fail("토큰 요청 실패 (HTTP \(code))") }
-    return json(d)
-}
-
-func makeAccount(_ j: [String: Any], id: String?, oldRefresh: String = "") throws -> ClaudeAccount {
-    guard let at = j["access_token"] as? String else { throw Fail("토큰 응답 이상") }
-    let email = (j["account"] as? [String: Any])?["email_address"] as? String
-    return ClaudeAccount(id: id ?? email ?? "Claude \(Int.random(in: 100...999))", access: at,
-                         refresh: j["refresh_token"] as? String ?? oldRefresh,
-                         expires: Date().addingTimeInterval(num(j["expires_in"]) ?? 3600))
-}
-
-func exchange(pasted: String, verifier: String, state: String) async throws -> ClaudeAccount {
-    let parts = pasted.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "#").map(String.init)
-    guard let code = parts.first, !code.isEmpty else { throw Fail("코드를 붙여넣으세요") }
-    let j = try await tokenCall(["grant_type": "authorization_code", "code": code, "state": parts.count > 1 ? parts[1] : state,
-                                 "client_id": claudeClient, "redirect_uri": claudeRedirect, "code_verifier": verifier])
-    return try makeAccount(j, id: nil)
-}
-
-func refreshed(_ a: ClaudeAccount) async throws -> ClaudeAccount {
-    let j = try await tokenCall(["grant_type": "refresh_token", "refresh_token": a.refresh, "client_id": claudeClient])
-    return try makeAccount(j, id: a.id, oldRefresh: a.refresh)
-}
-
-func fetchClaude(token: String) async throws -> [Win] {
-    let j = try await getJSON("https://api.anthropic.com/api/oauth/usage",
-                              ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20", "User-Agent": claudeUA])
-    let keys = [("five_hour", "5시간"), ("seven_day", "주간"), ("seven_day_opus", "주간 Opus"),
-                ("seven_day_sonnet", "주간 Sonnet"), ("seven_day_fable", "주간 Fable")]
-    return keys.compactMap { k, name in
-        guard let w = j[k] as? [String: Any], let u = num(w["utilization"]) else { return nil }
-        return Win(name: name, used: u, reset: iso(w["resets_at"]))
-    }
-}
-
-func fetchCodex() async throws -> [Win] {
-    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
-    guard let d = try? Data(contentsOf: url), let t = json(d)["tokens"] as? [String: Any],
-          let at = t["access_token"] as? String else { throw Fail("codex login 필요") }
-    var h = ["Authorization": "Bearer \(at)", "User-Agent": "codex_cli_rs"]
-    if let a = t["account_id"] as? String { h["chatgpt-account-id"] = a }
-    let rl = try await getJSON("https://chatgpt.com/backend-api/wham/usage", h)["rate_limit"] as? [String: Any] ?? [:]
-    return ["primary_window", "secondary_window"].compactMap { k in
-        guard let w = rl[k] as? [String: Any], let u = num(w["used_percent"]) else { return nil }
-        let hrs = Int(num(w["limit_window_seconds"]) ?? 0) / 3600
-        let reset = num(w["reset_at"]).map { Date(timeIntervalSince1970: $0) }
-            ?? num(w["reset_after_seconds"]).map { Date().addingTimeInterval($0) }
-        return Win(name: hrs >= 24 ? "주간" : "\(hrs)시간", used: u, reset: reset)
+final class NotiDelegate: NSObject, UNUserNotificationCenterDelegate {
+    func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
     }
 }
 
 @MainActor final class Store: ObservableObject {
-    @Published var providers: [Provider] = []
+    @Published var rows: [Row] = []
     @Published var updated: Date?
     @Published var accounts = Vault.load()
-    @Published var login: (verifier: String, state: String)?
+    @Published var claudeLogin: (verifier: String, state: String)?
     @Published var pasted = ""
-    @Published var loginError: String?
+    @Published var status: String?
+    @Published var report: [ModelTotal]?
+    @Published var reportLoading = false
+    @Published var history = (try? Data(contentsOf: historyURL)).flatMap { try? JSONDecoder().decode([String: [Point]].self, from: $0) } ?? [:]
+    @Published var threshold = UserDefaults.standard.object(forKey: "threshold") as? Int ?? 20 {
+        didSet { UserDefaults.standard.set(threshold, forKey: "threshold") }
+    }
+    let notiDelegate = NotiDelegate()
 
     func refresh() async {
-        var out: [(String, Result<[Win], Error>)] = []
-        for i in accounts.indices {
-            let r = await Result {
-                if accounts[i].expires < Date().addingTimeInterval(60) {
-                    accounts[i] = try await refreshed(accounts[i]); Vault.save(accounts)
-                }
-                return try await fetchClaude(token: accounts[i].access)
-            }
-            out.append(("Claude · \(accounts[i].id)", r))
-        }
-        out.append(("Codex", await Result { try await fetchCodex() }))
-        providers = out.map { name, r in
-            switch r {
-            case .success(let w): Provider(id: name, wins: w)
-            // keep last good numbers on failure (the Claude endpoint 429s easily)
-            case .failure(let e): Provider(id: name, wins: providers.first { $0.id == name }?.wins ?? [],
-                                           error: e.localizedDescription)
-            }
-        }
+        var out: [Row] = []
+        for a in accounts { out.append(await row(for: a, removable: true)) }
+        if !accounts.contains(where: { $0.kind == .codex }), let cli = codexCLIAccount() { out.append(await row(for: cli, removable: false)) }
+        for r in out where r.error == nil { for w in r.wins { checkAlerts(r, w) } }
+        rows = out
+        record()
         updated = Date()
     }
 
-    func startLogin() {
-        let l = (verifier: randomB64(32), state: randomB64(16))
-        login = l; pasted = ""; loginError = nil
-        NSWorkspace.shared.open(authorizeURL(verifier: l.verifier, state: l.state))
-    }
-
-    func finishLogin() async {
-        guard let l = login else { return }
+    private func row(for start: Account, removable: Bool) async -> Row {
+        var a = start
+        let old = rows.first { $0.id == a.id }
         do {
-            let a = try await exchange(pasted: pasted, verifier: l.verifier, state: l.state)
-            accounts.removeAll { $0.id == a.id }
-            accounts.append(a); Vault.save(accounts)
-            login = nil
-            await refresh()
-        } catch { loginError = error.localizedDescription }
+            if a.expires < Date().addingTimeInterval(60), !a.refresh.isEmpty {
+                do { a = try await makeAccount(a.kind, tokenCall(a.kind, refresh: a.refresh), old: a) } catch { throw AuthExpired() }
+                if let i = accounts.firstIndex(where: { $0.id == a.id }) { accounts[i] = a; Vault.save(accounts) }
+            }
+            let u = try await fetchUsage(a)
+            fired.remove("auth|\(a.id)")
+            return Row(account: a, wins: u.wins, note: u.note, redeemable: u.redeemable, removable: removable)
+        } catch {
+            if error is AuthExpired, fired.insert("auth|\(a.id)").inserted {
+                notify("\(a.kind.title) 로그인 만료", "\(a.label) 계정을 다시 연결해야 사용량을 계속 볼 수 있어요.")
+            }
+            // keep last good numbers on failure (the Claude endpoint 429s easily)
+            return Row(account: a, wins: old?.wins ?? [], note: old?.note, error: error.localizedDescription, removable: removable)
+        }
     }
 
-    func remove(_ id: String) {
-        accounts.removeAll { $0.id == id }; Vault.save(accounts)
-        providers.removeAll { $0.id == "Claude · \(id)" }
+    // MARK: notifications: threshold, reset (early or on time), auth expiry
+
+    private var fired = Set(UserDefaults.standard.stringArray(forKey: "fired") ?? []) {
+        didSet { UserDefaults.standard.set(Array(fired.suffix(500)), forKey: "fired") }
     }
 
-    var minRemaining: Int? { providers.flatMap(\.wins).map { Int((100 - $0.used).rounded()) }.min() }
+    private func notify(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent(); c.title = title; c.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    private func checkAlerts(_ r: Row, _ w: Win) {
+        let left = Int((100 - w.used).rounded())
+        let epoch = Int((w.reset?.timeIntervalSince1970 ?? 0) / 3600)
+        if left <= threshold, fired.insert("low|\(r.id)|\(w.name)|\(epoch)").inserted {
+            notify("\(r.title) \(w.name) 남은 \(left)%", w.reset.map { "리셋까지 \(RelativeDateTimeFormatter().localizedString(for: $0, relativeTo: Date()))" } ?? "")
+        }
+        guard let prev = rows.first(where: { $0.id == r.id })?.wins.first(where: { $0.name == w.name }), prev.used - w.used >= 10 else { return }
+        let early = prev.reset.map { Date() < $0.addingTimeInterval(-120) } ?? false
+        notify("\(r.title) \(w.name) \(early ? "일찍 리셋됨" : "리셋됨")", "지금 남은 \(left)%")
+    }
+
+    // MARK: history (7 days)
+
+    private func record() {
+        let now = Date(), cutoff = now.addingTimeInterval(-7 * 86400)
+        for r in rows where r.error == nil {
+            for w in r.wins { history["\(r.id)|\(w.name)", default: []].append(Point(t: now, remaining: 100 - w.used)) }
+        }
+        history = history.mapValues { $0.filter { $0.t > cutoff } }.filter { !$0.value.isEmpty }
+        try? JSONEncoder().encode(history).write(to: historyURL)
+    }
+
+    // MARK: accounts
+
+    func startLogin(_ k: Kind) {
+        let v = randomB64(32), s = randomB64(16), url = authorizeURL(k, verifier: v, state: s)
+        status = nil
+        if k == .claude { claudeLogin = (v, s); pasted = ""; NSWorkspace.shared.open(url); return }
+        status = "\(k.title): 브라우저에서 로그인하세요…"
+        Task {
+            do {
+                let q = try await waitForCallback(port: k == .codex ? 1455 : 22255) { NSWorkspace.shared.open(url) }
+                guard q["state"] == s, let code = q["code"] else { throw Fail("잘못된 콜백") }
+                let a = try await makeAccount(k, tokenCall(k, code: code, verifier: v, state: s))
+                status = nil
+                await add(a)
+            } catch { status = "\(k.title) 연결 실패: \(error.localizedDescription)" }
+        }
+    }
+
+    func finishClaude() async {
+        guard let l = claudeLogin else { return }
+        let parts = pasted.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "#").map(String.init)
+        do {
+            guard let code = parts.first, !code.isEmpty else { throw Fail("코드를 붙여넣으세요") }
+            let a = try await makeAccount(.claude, tokenCall(.claude, code: code, verifier: l.verifier,
+                                                              state: parts.count > 1 ? parts[1] : l.state))
+            claudeLogin = nil; status = nil
+            await add(a)
+        } catch { status = "Claude 연결 실패: \(error.localizedDescription)" }
+    }
+
+    private func add(_ a: Account) async {
+        accounts.removeAll { $0.id == a.id }; accounts.append(a); Vault.save(accounts)
+        await refresh()
+    }
+
+    func remove(_ r: Row) {
+        accounts.removeAll { $0.id == r.id }; Vault.save(accounts)
+        rows.removeAll { $0.id == r.id }
+    }
+
+    func redeem(_ r: Row) async {
+        do { try await redeemCodexReset(r.account); await refresh() } catch { status = "리셋 실패: \(error.localizedDescription)" }
+    }
+
+    func loadReport() async {
+        reportLoading = true
+        report = await Task.detached { monthReport() }.value
+        reportLoading = false
+    }
+
+    var minRemaining: Int? { rows.flatMap(\.wins).map { Int((100 - $0.used).rounded()) }.min() }
 }
 
-extension Result where Failure == Error {
-    init(catching body: () async throws -> Success) async {
-        do { self = .success(try await body()) } catch { self = .failure(error) }
+struct RowView: View {
+    @ObservedObject var store: Store
+    let row: Row
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(row.title).font(.headline).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                if row.removable {
+                    Button { store.remove(row) } label: { Image(systemName: "xmark.circle") }
+                        .buttonStyle(.borderless).help("계정 제거")
+                }
+            }
+            if let e = row.error { Text(e).font(.caption).foregroundStyle(.secondary) }
+            ForEach(row.wins) { w in
+                HStack { Text(w.name); Spacer(); Text("남은 \(Int((100 - w.used).rounded()))%").monospacedDigit() }.font(.callout)
+                ProgressView(value: min(max(w.used, 0), 100), total: 100)
+                    .tint(w.used >= 90 ? .red : w.used >= 70 ? .orange : .accentColor)
+                if let pts = store.history["\(row.id)|\(w.name)"], pts.count > 1 {
+                    Chart(pts, id: \.t) { LineMark(x: .value("시간", $0.t), y: .value("남은 %", $0.remaining)) }
+                        .chartYScale(domain: 0...100).chartXAxis(.hidden).chartYAxis(.hidden).frame(height: 26)
+                        .help("최근 7일 남은 양")
+                }
+                if let r = w.reset { Text("리셋 \(r, style: .relative) 후").font(.caption2).foregroundStyle(.secondary) }
+            }
+            if let n = row.note {
+                HStack {
+                    Text(n).font(.caption).foregroundStyle(.secondary)
+                    if row.redeemable { Button("지금 리셋") { Task { await store.redeem(row) } }.controlSize(.small) }
+                }
+            }
+        }
     }
 }
 
 struct Panel: View {
     @ObservedObject var store: Store
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            ForEach(store.providers) { p in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(p.id).font(.headline).lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        if p.id.hasPrefix("Claude · ") {
-                            Button { store.remove(String(p.id.dropFirst(9))) } label: { Image(systemName: "xmark.circle") }
-                                .buttonStyle(.borderless).help("계정 제거")
-                        }
-                    }
-                    if let e = p.error { Text(e).font(.caption).foregroundStyle(.secondary) }
-                    ForEach(p.wins) { w in
-                        HStack { Text(w.name); Spacer(); Text("남은 \(Int((100 - w.used).rounded()))%").monospacedDigit() }
-                            .font(.callout)
-                        ProgressView(value: min(w.used, 100), total: 100).tint(w.used >= 90 ? .red : w.used >= 70 ? .orange : .accentColor)
-                        if let r = w.reset {
-                            Text("리셋 \(r, style: .relative) 후").font(.caption2).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(store.rows) { RowView(store: store, row: $0) }
+            if store.rows.isEmpty { Text("계정을 연결하세요").foregroundStyle(.secondary) }
             Divider()
-            if store.login != nil {
+            if store.claudeLogin != nil {
                 Text("브라우저에서 승인 후 나온 코드를 붙여넣으세요").font(.caption)
                 HStack {
                     TextField("code#state", text: $store.pasted).textFieldStyle(.roundedBorder)
-                    Button("연결") { Task { await store.finishLogin() } }
-                    Button("취소") { store.login = nil }
+                    Button("연결") { Task { await store.finishClaude() } }
+                    Button("취소") { store.claudeLogin = nil }
                 }
-                if let e = store.loginError { Text(e).font(.caption).foregroundStyle(.red) }
             } else {
-                Button("Claude 계정 추가") { store.startLogin() }
+                Menu("계정 추가") {
+                    ForEach(Kind.allCases, id: \.self) { k in
+                        Button(k.title) { store.startLogin(k) }.disabled(k == .antigravity && antigravitySecret.isEmpty)
+                    }
+                }.fixedSize()
             }
+            if let s = store.status { Text(s).font(.caption).foregroundStyle(.secondary) }
+            Stepper("남은 \(store.threshold)% 이하면 알림", value: $store.threshold, in: 0...100, step: 5).font(.callout)
+            Divider()
+            HStack {
+                Text("이번 달 로컬 사용량").font(.headline)
+                Spacer()
+                Button(store.reportLoading ? "계산 중…" : "계산") { Task { await store.loadReport() } }
+                    .controlSize(.small).disabled(store.reportLoading)
+            }
+            if let rep = store.report {
+                ForEach(rep.prefix(8)) { m in
+                    HStack {
+                        Text("\(m.source) · \(m.model)").lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Text(String(format: "%.1fM", m.tokens / 1e6)).foregroundStyle(.secondary)
+                        Text(m.cost.map { String(format: "$%.2f", $0) } ?? "–").frame(width: 64, alignment: .trailing)
+                    }.font(.caption).monospacedDigit()
+                }
+                Text(String(format: "합계 API 환산 $%.2f", rep.compactMap(\.cost).reduce(0, +))).font(.caption.bold())
+            }
+            Divider()
             HStack {
                 if let u = store.updated { Text(u, style: .time).font(.caption).foregroundStyle(.secondary) }
                 Spacer()
@@ -229,18 +239,27 @@ struct Panel: View {
             }
         }
         .padding()
-        .frame(width: 280)
+        .frame(width: 330)
     }
 }
 
 @main struct UseAIApp: App {
     @StateObject var store = Store()
+    init() { // self-check: print this month's local report and quit
+        guard CommandLine.arguments.contains("--report") else { return }
+        for m in monthReport() { print(m.source, m.model, Int(m.tokens), m.cost.map { String(format: "$%.2f", $0) } ?? "unpriced") }
+        exit(0)
+    }
     var body: some Scene {
         MenuBarExtra {
             Panel(store: store)
         } label: {
             Text(store.minRemaining.map { "AI \($0)%" } ?? "AI")
-                .task { while true { await store.refresh(); try? await Task.sleep(for: .seconds(300)) } }
+                .task {
+                    UNUserNotificationCenter.current().delegate = store.notiDelegate
+                    Task { _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) }
+                    while true { await store.refresh(); try? await Task.sleep(for: .seconds(300)) }
+                }
         }
         .menuBarExtraStyle(.window)
     }
