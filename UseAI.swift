@@ -15,7 +15,8 @@ func getJSON(_ url: String, _ headers: [String: String]) async throws -> [String
     headers.forEach { r.setValue($1, forHTTPHeaderField: $0) }
     let (d, resp) = try await URLSession.shared.data(for: r)
     let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-    guard code == 200 else { throw Fail(code == 401 ? "토큰 만료 — CLI를 한 번 실행하세요" : "HTTP \(code)") }
+    if CommandLine.arguments.contains("--dump") { print(url, code, String(decoding: d, as: UTF8.self)); fflush(stdout) }
+    guard code == 200 else { throw Fail(code == 401 ? "토큰 만료 — CLI를 한 번 실행하세요" : code == 429 ? "요청 제한 중 — 이전 값 표시" : "HTTP \(code)") }
     return json(d)
 }
 
@@ -70,7 +71,9 @@ func fetchCodex() async throws -> [Win] {
         providers = [("Claude", await c), ("Codex", await x)].map { name, r in
             switch r {
             case .success(let w): Provider(id: name, wins: w)
-            case .failure(let e): Provider(id: name, error: e.localizedDescription)
+            // keep last good numbers on failure (the Claude endpoint 429s easily)
+            case .failure(let e): Provider(id: name, wins: providers.first { $0.id == name }?.wins ?? [],
+                                           error: e.localizedDescription)
             }
         }
         updated = Date()
