@@ -146,7 +146,9 @@ func waitForCallback(port: UInt16, onReady: @escaping @Sendable () -> Void) asyn
 // MARK: - Provider definitions
 
 let claudeClient = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-let claudeRedirect = "https://console.anthropic.com/oauth/code/callback"
+// The original app (1.1.2) still uses console.anthropic.com + claude.ai/oauth/authorize, which claude.ai now rejects
+// ("Invalid request format"); these match Claude Code 2.1.322's own config.
+let claudeRedirect = "https://platform.claude.com/oauth/code/callback"
 let claudeUA = "claude-cli/2.1.280 (external, cli)" // exact string in the original snapshot (ev_ffa8cb30)
 let codexClient = "app_EMoamEEZ73f0CkXaXp7hrann"
 let codexRedirect = "http://localhost:1455/auth/callback"
@@ -158,9 +160,9 @@ func authorizeURL(_ k: Kind, verifier: String, state: String) -> URL {
     let base: String, extra: [(String, String)]
     switch k {
     case .claude:
-        base = "https://claude.ai/oauth/authorize"
+        base = "https://claude.com/cai/oauth/authorize"
         extra = [("code", "true"), ("client_id", claudeClient), ("redirect_uri", claudeRedirect),
-                 ("scope", "org:create_api_key user:profile user:inference")]
+                 ("scope", "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload")]
     case .codex:
         base = "https://auth.openai.com/oauth/authorize"
         extra = [("client_id", codexClient), ("redirect_uri", codexRedirect), ("scope", "openid profile email offline_access"),
