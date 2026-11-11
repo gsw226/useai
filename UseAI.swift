@@ -27,6 +27,7 @@ func iso(_ v: Any?) -> Date? { (v as? String).flatMap { isoFrac.date(from: $0) ?
 // --- Claude accounts: same OAuth client/flow the original app uses (Claude Code's public client, PKCE, paste-code) ---
 let claudeClient = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 let claudeRedirect = "https://console.anthropic.com/oauth/code/callback"
+let claudeUA = "claude-cli/2.1.280 (external, cli)" // exact string in the original snapshot (REA ev_ffa8cb30)
 
 struct ClaudeAccount: Codable, Identifiable { var id: String; var access: String; var refresh: String; var expires: Date }
 
@@ -65,6 +66,7 @@ func tokenCall(_ body: [String: String]) async throws -> [String: Any] {
     var r = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
     r.httpMethod = "POST"
     r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    r.setValue(claudeUA, forHTTPHeaderField: "User-Agent")
     r.httpBody = try JSONSerialization.data(withJSONObject: body)
     let (d, resp) = try await URLSession.shared.data(for: r)
     let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -95,7 +97,7 @@ func refreshed(_ a: ClaudeAccount) async throws -> ClaudeAccount {
 
 func fetchClaude(token: String) async throws -> [Win] {
     let j = try await getJSON("https://api.anthropic.com/api/oauth/usage",
-                              ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20"])
+                              ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20", "User-Agent": claudeUA])
     let keys = [("five_hour", "5시간"), ("seven_day", "주간"), ("seven_day_opus", "주간 Opus"),
                 ("seven_day_sonnet", "주간 Sonnet"), ("seven_day_fable", "주간 Fable")]
     return keys.compactMap { k, name in
