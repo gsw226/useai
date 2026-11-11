@@ -162,7 +162,7 @@ func authorizeURL(_ k: Kind, verifier: String, state: String) -> URL {
     case .claude:
         base = "https://claude.com/cai/oauth/authorize"
         extra = [("code", "true"), ("client_id", claudeClient), ("redirect_uri", claudeRedirect),
-                 ("scope", "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload")]
+                 ("scope", "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins")]
     case .codex:
         base = "https://auth.openai.com/oauth/authorize"
         extra = [("client_id", codexClient), ("redirect_uri", codexRedirect), ("scope", "openid profile email offline_access"),

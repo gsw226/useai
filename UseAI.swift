@@ -104,7 +104,7 @@ final class NotiDelegate: NSObject, UNUserNotificationCenterDelegate {
     // MARK: accounts
 
     func startLogin(_ k: Kind) {
-        let v = randomB64(32), s = randomB64(16), url = authorizeURL(k, verifier: v, state: s)
+        let v = randomB64(32), s = randomB64(32), url = authorizeURL(k, verifier: v, state: s)
         status = nil
         if k == .claude { claudeLogin = (v, s); pasted = ""; NSWorkspace.shared.open(url); return }
         status = "\(k.title): 브라우저에서 로그인하세요…"
