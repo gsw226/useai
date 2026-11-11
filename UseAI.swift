@@ -170,7 +170,7 @@ struct RowView: View {
             if let e = row.error { Text(e).font(.caption).foregroundStyle(.secondary) }
             ForEach(row.wins) { w in
                 HStack { Text(w.name); Spacer(); Text("남은 \(Int((100 - w.used).rounded()))%").monospacedDigit() }.font(.callout)
-                ProgressView(value: min(max(w.used, 0), 100), total: 100)
+                ProgressView(value: min(max(100 - w.used, 0), 100), total: 100)
                     .tint(w.used >= 90 ? .red : w.used >= 70 ? .orange : .accentColor)
                 if let pts = store.history["\(row.id)|\(w.name)"], pts.count > 1 {
                     Chart(pts, id: \.t) { LineMark(x: .value("시간", $0.t), y: .value("남은 %", $0.remaining)) }
